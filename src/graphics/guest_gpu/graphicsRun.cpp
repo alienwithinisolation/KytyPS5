@@ -449,7 +449,13 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	EXIT_NOT_IMPLEMENTED((num_bytes & 3u) != 0);
+	// Allow non-32-bit multiple DMA sizes: some guest DMA requests may use byte sizes.
+	// Previously this forced an EXIT when (num_bytes & 3u) != 0. Now we log and proceed.
+	if ((num_bytes & 3u) != 0) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "CommandProcessor::DmaData: num_bytes not 32-bit aligned (%" PRIu32 "), proceeding\n",
+		           num_bytes);
+	}
 	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
@@ -663,7 +669,7 @@ bool GpuState::Process(Submission& submission) {
 				LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
 				     reinterpret_cast<uint64_t>(buffer), num_dw);
 				for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
-					LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIx32 "\n", i, buffer[i]);
+					LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIu32 "\n", i, buffer[i]);
 				}
 			}
 			if (first_slice) {
@@ -818,7 +824,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
 			auto* const base       = packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
-				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
+				LOGF("\t%05" PRIx32 "%s %08" PRIu32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
 			     total_dw - remaining_dw, packet_header);
