@@ -944,7 +944,7 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 	return plan;
 }
 
-void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
+bool TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
                                uint64_t source_offset) {
 	const auto& info   = image.info;
 	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -956,7 +956,14 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 
 	if (desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
-		EXIT_NOT_IMPLEMENTED(!plan.valid);
+		if (!plan.valid) {
+			// Unsupported upload plan for this image. Log and defer upload.
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: unsupported upload plan for image at 0x%016" PRIx64
+			           " — deferring GPU upload\n",
+			           info.data.address);
+			return false;
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
 			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size, info.data.size,
@@ -966,9 +973,10 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			linear = m_tiler->SwapBgra16(linear);
 		}
 		upload(plan.regions, linear);
-		return;
+		return true;
 	}
 
+	// Depth upload path kept identical except the function now returns true at the end
 	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
@@ -1027,6 +1035,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		}
 	}
 	upload(copies, linear);
+	return true;
 }
 
 void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
