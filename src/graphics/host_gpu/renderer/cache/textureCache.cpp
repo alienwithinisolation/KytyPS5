@@ -976,7 +976,6 @@ bool TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return true;
 	}
 
-	// Depth upload path kept identical except the function now returns true at the end
 	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
@@ -1061,10 +1060,11 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 		if (source.buffer == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		data_imported = true;
-		UploadImage(image, desc, *source.buffer, source.offset);
+		// UploadImage returns whether the upload actually occurred.
+		data_imported = UploadImage(image, desc, *source.buffer, source.offset);
 	}
 	if (data_imported) {
+		// Only clear buffer-modified state when the upload actually succeeded.
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
