@@ -137,8 +137,11 @@ private:
 	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
 	                                                   TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
-	// Returns true if the upload was performed, false if it was deferred/not supported
-	// (keeps guest buffer ownership / buffer-modified state).
+	/*
+	 Returns true if the image data upload to the native GPU image was performed.
+	 Returns false if the upload is deferred (unsupported transfer plan). When false,
+	 the guest buffer remains the authoritative copy and the image remains buffer-modified.
+	*/
 	bool UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
