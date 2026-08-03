@@ -195,10 +195,12 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
-	std::vector<ImageOwnerIndex::ByteRange> ranges;
-	ranges.push_back({image.info.data.address, image.info.data.size});
-	if (!m_image_owner_index.Register(id, ranges)) {
-		EXIT("TextureCache: duplicate or invalid image registration\n");
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+		EXIT("TextureCache: image registration is outside the guest address space\n");
+	}
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		m_image_page_table[page].push_back(id);
 	}
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -211,9 +213,15 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
-	std::vector<ImageOwnerIndex::ByteRange> releases;
-	if (!m_image_owner_index.Unregister(id, releases)) {
-		EXIT("TextureCache: image missing from owner index\n");
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+		EXIT("TextureCache: registered image is outside the guest address space\n");
+	}
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr || !owners->Erase(id)) {
+			EXIT("TextureCache: image missing from page owner index\n");
+		}
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -451,10 +459,48 @@ const Image& TextureCache::GetImage(ImageId id) const {
 	return ResolveImage(id);
 }
 
-std::vector<ImageId> TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
-                                                      bool page_overlap) const {
-	return page_overlap ? m_image_owner_index.QueryCandidates(address, size)
-	                    : m_image_owner_index.Query(address, size);
+TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
+                                                        bool page_overlap) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return {};
+	}
+
+	uint32_t query_epoch = ++m_image_query_epoch;
+	if (query_epoch == 0) {
+		for (const auto& slot: m_slots) {
+			if (slot.image != nullptr) {
+				slot.image->query_epoch = 0;
+			}
+		}
+		query_epoch = ++m_image_query_epoch;
+	}
+
+	ImageIds result;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr) {
+			continue;
+		}
+		owners->ForEach([&](ImageId id) {
+			if (!id || id.index >= m_slots.size()) {
+				return;
+			}
+			const auto& slot = m_slots[id.index];
+			if (slot.generation != id.generation || slot.image == nullptr) {
+				return;
+			}
+			auto& image = *slot.image;
+			if (image.query_epoch == query_epoch) {
+				return;
+			}
+			image.query_epoch = query_epoch;
+			if (image.Overlaps(address, size, page_overlap)) {
+				result.push_back(id);
+			}
+		});
+	}
+	return result;
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
@@ -838,10 +884,19 @@ struct TextureCache::ColorTransferPlan {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
+	uint64_t                         linear_size = 0;
 	bool                             tiled       = false;
 	bool                             swap_bgra16 = false;
 	bool                             valid       = false;
 };
+
+static uint64_t GetLinearSize(std::span<const GpuTileInfo> tiles) {
+	uint64_t size = 0;
+	for (const auto& tile: tiles) {
+		size = std::max(size, tile.linear_offset + tile.linear_size);
+	}
+	return size;
+}
 
 struct TextureCache::DownloadPlan {
 	ColorTransferPlan color;
@@ -919,6 +974,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		                              info.resources.levels, plan.tiles)) {
 			return plan;
 		}
+		plan.linear_size = GetLinearSize(plan.tiles);
 	}
 	plan.valid = true;
 	return plan;
@@ -956,11 +1012,19 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 
 	if (desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
-		EXIT_NOT_IMPLEMENTED(!plan.valid);
+		if (!plan.valid) {
+			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
+			     "pitch=%u levels=%u layers=%u samples=%u\n",
+			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
+			     info.guest_format, info.tile_mode, static_cast<uint32_t>(plan.layout.tile_family),
+			     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+			     info.resources.levels, info.resources.layers, info.samples);
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
-			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size, info.data.size,
-			                         plan.tiles);
+			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size,
+			                         plan.linear_size, plan.tiles);
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler->SwapBgra16(linear);
@@ -1134,9 +1198,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	bool    inserted_new = false;
 	{
-		std::lock_guard            transaction(m_resource_mutex);
-		CacheLock                  lock(*this, m_lock);
-		const std::vector<ImageId> candidates =
+		std::lock_guard transaction(m_resource_mutex);
+		CacheLock       lock(*this, m_lock);
+		const auto      candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
@@ -1566,7 +1630,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	}
 
 	m_tiler->TileImage(image, color.regions, destination.Handle(), destination_offset,
-	                   destination_size, destination_size, color.tiles, transform);
+	                   destination_size, color.linear_size, color.tiles, transform);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1659,6 +1723,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			                              image.info.TransferLayers(), levels, color.tiles)) {
 				return false;
 			}
+			color.linear_size = GetLinearSize(color.tiles);
 		}
 	}
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));

@@ -39,6 +39,7 @@
 #include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
 #include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/BindingLayout.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "spirv-tools/libspirv.hpp"
@@ -162,6 +163,10 @@ struct TileManagerTestAccess {
 };
 
 struct TextureCacheTestAccess {
+	static_assert(TextureCache::ImagePageTable::kPageBits == 20);
+	static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
+	static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
+
 	static void ConfigureGarbageCollection(TextureCache& cache, std::span<const ImageId> oldest,
 	                                       uint64_t tick, uint64_t pressure) {
 		cache.m_trigger_gc_memory  = 0;
@@ -194,6 +199,75 @@ struct TextureCacheTestAccess {
 	static bool Contains(const TextureCache& cache, ImageId id) {
 		const auto owner = cache.ResolveOwner(id);
 		return owner != nullptr && owner->registered;
+	}
+
+	static std::vector<ImageId> FindImages(TextureCache& cache, uint64_t address, uint64_t size,
+	                                       bool page_overlap) {
+		std::lock_guard      lock(cache.m_lock);
+		const auto           found = cache.FindImagesInRegion(address, size, page_overlap);
+		std::vector<ImageId> result;
+		result.reserve(found.size());
+		for (const auto id: found) {
+			result.push_back(id);
+		}
+		return result;
+	}
+
+	static size_t PageOwnerCount(TextureCache& cache, uint64_t address) {
+		std::lock_guard lock(cache.m_lock);
+		const auto*     owners = cache.m_image_page_table.Find(
+		    static_cast<size_t>(address >> TextureCache::ImagePageTable::kPageBits));
+		return owners == nullptr ? 0 : owners->size();
+	}
+
+	static size_t OwnedPageCount(TextureCache& cache, uint64_t address, uint64_t size, ImageId id) {
+		std::lock_guard                  lock(cache.m_lock);
+		TextureCache::ImagePageTable::PageRange pages {};
+		if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return 0;
+		}
+		size_t count = 0;
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			const auto* owners = cache.m_image_page_table.Find(page);
+			count += owners != nullptr && owners->Contains(id) ? 1 : 0;
+		}
+		return count;
+	}
+
+	static void AddPageOwner(TextureCache& cache, uint64_t address, ImageId id) {
+		std::lock_guard lock(cache.m_lock);
+		cache.m_image_page_table[static_cast<size_t>(
+		    address >> TextureCache::ImagePageTable::kPageBits)]
+		    .push_back(id);
+	}
+
+	static bool RemovePageOwner(TextureCache& cache, uint64_t address, ImageId id) {
+		std::lock_guard lock(cache.m_lock);
+		auto*           owners = cache.m_image_page_table.Find(
+		    static_cast<size_t>(address >> TextureCache::ImagePageTable::kPageBits));
+		return owners != nullptr && owners->Erase(id);
+	}
+
+	static void SetQueryEpoch(TextureCache& cache, uint32_t epoch) {
+		std::lock_guard lock(cache.m_lock);
+		cache.m_image_query_epoch = epoch;
+	}
+
+	static uint32_t QueryEpoch(TextureCache& cache) {
+		std::lock_guard lock(cache.m_lock);
+		return cache.m_image_query_epoch;
+	}
+
+	static ImageId InsertImage(TextureCache& cache, const ImageInfo& info) {
+		std::lock_guard transaction(cache.m_resource_mutex);
+		std::lock_guard lock(cache.m_lock);
+		return cache.InsertImage(info);
+	}
+
+	static void DeleteImage(TextureCache& cache, ImageId id) {
+		std::lock_guard transaction(cache.m_resource_mutex);
+		std::lock_guard lock(cache.m_lock);
+		cache.DeleteImage(id);
 	}
 
 	static std::shared_ptr<Image> Owner(const TextureCache& cache, ImageId id) {
@@ -769,6 +843,91 @@ void ValidateSpirv(const char* shader_name, const std::vector<u32>& spirv) {
 	if (!tools.Validate(spirv)) {
 		Fail(shader_name, "SPIR-V validation", messages);
 	}
+}
+
+size_t CountText(const std::string& text, const std::string& needle) {
+	size_t count = 0;
+	for (size_t offset = 0; (offset = text.find(needle, offset)) != std::string::npos;
+	     offset += needle.size()) {
+		count++;
+	}
+	return count;
+}
+
+void CheckRectListShaders() {
+	constexpr const char* name = "RectListShaders";
+
+	auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
+
+	ShaderVertexInputInfo vertex {};
+	vertex.param_export_mask = 1u;
+	ShaderPixelInputInfo pixel {};
+	pixel.input_num                = 2;
+	pixel.interpolator_settings[0] = 0x400u;
+	pixel.interpolator_settings[1] = 0;
+	pixel.stage.program            = program;
+	HW::PixelShaderInfo ps_regs {};
+	const auto          perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = true;
+	const auto no_perspective_id       = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = false;
+	Require(name, "pipeline identity", perspective_id != no_perspective_id,
+	        "pixel interpolation mode must participate in the shader and pipeline key");
+
+	const std::array<uint32_t, 2> active_inputs = {0, 1};
+	Require(name, "duplicate mapping",
+	        ShaderPixelParameterLocation(pixel, active_inputs, 0) == 0 &&
+	            ShaderPixelParameterLocation(pixel, active_inputs, 1) == 1,
+	        "duplicate pixel mappings must receive distinct effective output locations");
+
+	const auto shaders = BuildRectListShaders(vertex, &pixel);
+	Require(name, "SPIR-V version",
+	        shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
+	            shaders.evaluation.size() > 1 && shaders.evaluation[1] == 0x00010500u,
+	        "shadPS4-compatible vector selection requires SPIR-V 1.5");
+	ValidateSpirv(name, shaders.control);
+	ValidateSpirv(name, shaders.evaluation);
+
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+	std::string          control_text;
+	std::string          evaluation_text;
+	Require(name, "control disassembly", tools.Disassemble(shaders.control, &control_text),
+	        "failed to disassemble rectangle-list tessellation control shader");
+	Require(name, "evaluation disassembly",
+	        tools.Disassemble(shaders.evaluation, &evaluation_text),
+	        "failed to disassemble rectangle-list tessellation evaluation shader");
+	Require(name, "control execution mode",
+	        control_text.find("TessellationControl") != std::string::npos &&
+	            control_text.find("OutputVertices 4") != std::string::npos,
+	        "rectangle-list control shader must produce four control points");
+	Require(name, "evaluation execution modes",
+	        evaluation_text.find("TessellationEvaluation") != std::string::npos &&
+	            evaluation_text.find("Quads") != std::string::npos &&
+	            evaluation_text.find("SpacingEqual") != std::string::npos &&
+	            evaluation_text.find("VertexOrderCw") != std::string::npos,
+	        "rectangle-list evaluation shader has the wrong patch modes");
+	Require(name, "no geometry stage",
+	        control_text.find("Geometry") == std::string::npos &&
+	            evaluation_text.find("Geometry") == std::string::npos,
+	        "rectangle-list expansion must not use geometry shaders");
+	Require(name, "flat broadcast",
+	        CountText(control_text, "OpVectorTimesScalar") == 6 &&
+	            CountText(control_text, "OpSelect %v4float") == 2,
+	        "flat parameters must use guest vertex zero instead of reconstructed values");
+	Require(name, "remapped interface",
+	        CountText(control_text, " Location 0") == 2 &&
+	            CountText(control_text, " Location 1") == 1 &&
+	            CountText(evaluation_text, " Location 0") == 2 &&
+	            CountText(evaluation_text, " Location 1") == 2,
+	        "duplicate pixel mappings must share one vertex input and keep distinct patch outputs");
+
+	const auto position_only = BuildRectListShaders(vertex, nullptr);
+	ValidateSpirv(name, position_only.control);
+	ValidateSpirv(name, position_only.evaluation);
 }
 
 void CheckSpirvText(const TestCase& test, const std::vector<u32>& spirv) {
@@ -2401,6 +2560,110 @@ public:
 			            texture_cache.GetImage(first).info.pixel_format ==
 			                vk::Format::eR8G8B8A8Srgb,
 			        "registered compatible backing did not reuse one ImageId");
+
+			const auto IsOnlyImage = [](const std::vector<ImageId>& ids, ImageId expected) {
+				return ids.size() == 1 && ids.front() == expected;
+			};
+			const auto exact_byte_miss =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, false);
+			const auto touched_page_hit =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, true);
+			const auto next_page_miss =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 0x1000, 1, true);
+			Require(name, "exact and 4-KiB page filtering",
+			        exact_byte_miss.empty() && IsOnlyImage(touched_page_hit, first) &&
+			            next_page_miss.empty(),
+			        "coarse candidates did not preserve exact-byte and touched-page semantics");
+
+			const auto MakeOwnershipInfo = [](uint64_t address, uint64_t size) {
+				ImageInfo info {};
+				info.data      = {address, size};
+				info.extent    = {1, 1, 1};
+				info.resources = {1, 1};
+				info.samples   = 1;
+				return info;
+			};
+			const auto spanning_info = MakeOwnershipInfo(base + 0x1ff000, 0x2000);
+			const auto spanning = TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
+			const auto spanning_results = TextureCacheTestAccess::FindImages(
+			    texture_cache, spanning_info.data.address, spanning_info.data.size, false);
+			Require(name, "one-MiB cross-page deduplication",
+			        spanning && IsOnlyImage(spanning_results, spanning) &&
+			            TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                                       spanning_info.data.address) == 1 &&
+			            TextureCacheTestAccess::PageOwnerCount(
+			                texture_cache, spanning_info.data.End() - 1) == 1,
+			        "an image spanning two coarse pages was missing or returned more than once");
+			TextureCacheTestAccess::DeleteImage(texture_cache, spanning);
+			Require(name, "cross-page owner cleanup",
+			        TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                               spanning_info.data.address) == 0 &&
+			            TextureCacheTestAccess::PageOwnerCount(
+			                texture_cache, spanning_info.data.End() - 1) == 0 &&
+			            TextureCacheTestAccess::FindImages(texture_cache,
+			                                               spanning_info.data.address,
+			                                               spanning_info.data.size, false)
+			                .empty(),
+			        "cross-page unregister left a stale coarse-page membership");
+
+			const auto shared_info = MakeOwnershipInfo(base + 0x500100, 0x100);
+			const auto shared_first =
+			    TextureCacheTestAccess::InsertImage(texture_cache, shared_info);
+			const auto shared_second =
+			    TextureCacheTestAccess::InsertImage(texture_cache, shared_info);
+			const auto shared_results = TextureCacheTestAccess::FindImages(
+			    texture_cache, shared_info.data.address, shared_info.data.size, false);
+			Require(name, "shared coarse-page registration",
+			        shared_results.size() == 2 &&
+			            std::find(shared_results.begin(), shared_results.end(), shared_first) !=
+			                shared_results.end() &&
+			            std::find(shared_results.begin(), shared_results.end(), shared_second) !=
+			                shared_results.end(),
+			        "two registered owners were not retained in one coarse page");
+			TextureCacheTestAccess::DeleteImage(texture_cache, shared_first);
+			const auto shared_survivor = TextureCacheTestAccess::FindImages(
+			    texture_cache, shared_info.data.address, shared_info.data.size, false);
+			Require(name, "shared coarse-page unregister",
+			        IsOnlyImage(shared_survivor, shared_second) &&
+			            TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                                       shared_info.data.address) == 1,
+			        "unregistering one owner removed its coarse-page neighbor");
+			TextureCacheTestAccess::DeleteImage(texture_cache, shared_second);
+			Require(name, "final shared coarse-page unregister",
+			        TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                               shared_info.data.address) == 0,
+			        "the final shared owner remained registered");
+
+			constexpr uint64_t large_owner_size = 64ull * 1024 * 1024;
+			const auto large_info = MakeOwnershipInfo(base + 0x800000, large_owner_size);
+			const auto large_owner =
+			    TextureCacheTestAccess::InsertImage(texture_cache, large_info);
+			Require(name, "production one-MiB registration granularity",
+			        TextureCacheTestAccess::OwnedPageCount(
+			            texture_cache, large_info.data.address, large_info.data.size, large_owner) == 64,
+			        "64 MiB image registration did not create exactly 64 coarse memberships");
+			TextureCacheTestAccess::DeleteImage(texture_cache, large_owner);
+			Require(name, "production one-MiB unregister granularity",
+			        TextureCacheTestAccess::OwnedPageCount(
+			            texture_cache, large_info.data.address, large_info.data.size, large_owner) == 0,
+			        "large image unregister left coarse memberships behind");
+
+			const ImageId stale {first.index, first.generation + 1};
+			TextureCacheTestAccess::AddPageOwner(texture_cache, base, stale);
+			const auto stale_filtered =
+			    TextureCacheTestAccess::FindImages(texture_cache, base, sizeof(initial), false);
+			Require(name, "stale page owner filtering",
+			        IsOnlyImage(stale_filtered, first) &&
+			            TextureCacheTestAccess::RemovePageOwner(texture_cache, base, stale),
+			        "a stale generation escaped the direct page-owner lookup");
+
+			TextureCacheTestAccess::SetQueryEpoch(texture_cache, UINT32_MAX);
+			const auto wrap_results =
+			    TextureCacheTestAccess::FindImages(texture_cache, base, sizeof(initial), false);
+			Require(name, "page-owner query epoch wrap",
+			        IsOnlyImage(wrap_results, first) &&
+			            TextureCacheTestAccess::QueryEpoch(texture_cache) == 1,
+			        "query deduplication failed while wrapping its epoch");
 
 			auto&              image               = texture_cache.GetImage(first);
 			constexpr uint32_t final_sampled_value = 0x88776655u;
@@ -5520,6 +5783,43 @@ public:
 			    "state at the final acquisition boundary");
 			RenderExecutorTestAccess::ResetBindings(executor);
 
+			constexpr uint64_t depth_only_address = base + 0x140000;
+			HW::DepthRenderTarget depth_only_target {};
+			depth_only_target.z_info.format =
+			    Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F);
+			depth_only_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
+			depth_only_target.stencil_info.htile_stencil_disabled = true;
+			depth_only_target.z_read_base_addr                    = depth_only_address;
+			depth_only_target.z_write_base_addr                   = depth_only_address;
+			depth_only_target.size                                = {63, 63, true};
+			registers.SetDepthRenderTarget(depth_only_target);
+			HW::DepthControl depth_only_control {};
+			depth_only_control.stencil_enable = true;
+			depth_only_control.z_enable       = true;
+			depth_only_control.z_write_enable = true;
+			depth_only_control.zfunc          = static_cast<uint8_t>(vk::CompareOp::eAlways);
+			registers.SetDepthControl(depth_only_control);
+			HW::RenderControl depth_only_render_control {};
+			depth_only_render_control.depth_clear_enable   = true;
+			depth_only_render_control.stencil_clear_enable = true;
+			registers.SetRenderControl(depth_only_render_control);
+			RenderDepthInfo depth_only {};
+			RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, 1, scheduler.Current(),
+			                                                   depth_only);
+			Require(
+			    name, "depth-only target with stale stencil state",
+			    depth_only.image_id && depth_only.format == vk::Format::eD32Sfloat &&
+			        depth_only.depth_test_enable && depth_only.depth_write_enable &&
+			        depth_only.depth_clear_enable && !depth_only.stencil_test_enable &&
+			        !depth_only.stencil_clear_enable && depth_only.stencil_buffer_vaddr == 0 &&
+			        depth_only.stencil_buffer_size == 0 && depth_only.desc.info.stencil.Empty() &&
+			        depth_only.depth_buffer_size != 0 &&
+			        depth_only_address + depth_only.depth_buffer_size <= base + allocation_size &&
+			        depth_only.vaddr_num == 1 &&
+			        depth_only.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eDepth,
+			    "raw stencil test or clear state leaked into a depth-only attachment");
+			RenderExecutorTestAccess::ResetBindings(executor);
+
 			auto video_subresource = make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});
 			video_subresource.type = BindingType::VideoOut;
 			video_subresource.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
@@ -7242,26 +7542,30 @@ public:
 		}
 
 		u32  case_index       = 0;
-		auto check_round_trip = [&](const char* stage, uint64_t size,
+		auto check_round_trip = [&](const char* stage, uint64_t tiled_size,
 		                            std::span<const GpuTileInfo> infos) {
-			std::vector<uint8_t> tiled(size);
-			std::vector<uint8_t> cpu(size, 0);
-			std::vector<uint8_t> gpu(size, 0xab);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			std::vector<uint8_t> tiled(tiled_size);
+			std::vector<uint8_t> cpu(linear_size, 0);
+			std::vector<uint8_t> gpu(linear_size, 0xab);
 			fill(&tiled, ++case_index);
 			for (const auto& info: infos) {
 				convert_reference(false, &cpu, tiled, info);
 			}
-			gpu_detile(tiled, &gpu, size, size, infos);
+			gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
 
-			std::vector<uint8_t> linear(size);
-			std::vector<uint8_t> cpu_tiled(size, 0xab);
-			std::vector<uint8_t> gpu_tiled(size, 0xab);
+			std::vector<uint8_t> linear(linear_size);
+			std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
+			std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
 			fill(&linear, 0x280u + case_index);
 			for (const auto& info: infos) {
 				convert_reference(true, &cpu_tiled, linear, info);
 			}
-			gpu_tile(linear, &gpu_tiled, size, size, infos);
+			gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " tile bytes").c_str(), cpu_tiled, gpu_tiled);
 		};
 		for (const auto family: families) {
@@ -7398,6 +7702,32 @@ public:
 		}
 		Require(name, "format coverage", format_cases != 0,
 		        "no CPU-supported standard formats were tested");
+
+		{
+			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm);
+			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+			constexpr u32 width = 256, height = 256, levels = 9;
+			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
+			TileSizeAlign total {};
+			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			                   nullptr);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
+			                                            tile, total.size, false, false, name);
+			const auto regions =
+			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			std::vector<GpuTileInfo> infos;
+			const bool built =
+			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			Require(name, "BC1 mip-tail capacities",
+			        built && total.size == 0x10000 && layout.first_tail_level == 0 &&
+			            linear_size == 0x15560 && linear_size > total.size,
+			        "BC1 mip tail conflated tiled and linear capacities");
+			check_round_trip("BC1 mip tail", total.size, infos);
+		}
 
 		{
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
@@ -15922,11 +16252,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
 		resource   = BasicArrayStorageTextureResource();
 		descriptor = BasicArrayStorageTextureDescriptor();
 		descriptor.fields[4] |= 1u << 16u;
-	} else if (std::strcmp(kind, "array-mip-view") == 0) {
-		resource   = BasicArrayStorageTextureResource();
-		descriptor = BasicArrayStorageTextureDescriptor();
-		descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
-		descriptor.fields[5] |= 1u << 4u;
 	} else if (std::strcmp(kind, "reserved") == 0) {
 		descriptor.fields[1] |= 1u << 29u;
 	} else if (std::strcmp(kind, "uint-format") == 0) {
@@ -16102,6 +16427,16 @@ void CheckBasicStorageTextureDescriptor() {
 	            array.DstSelXYZW() == DstSel(6, 5, 4, 7),
 	        "PPSA21268 2D-array storage descriptor fixture is malformed");
 	ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
+	const ShaderTextureResource mip_array {{0x20268d00u, 0xc4700000u, 0x001fc01fu,
+	                                        0xd1b11facu, 0x00000000u, 0x00700070u,
+	                                        0x00000000u, 0x00000000u}};
+	Require("BasicStorageTexture", "PPSA14457 mip-one 2D-array descriptor",
+	        mip_array.BaseLevel() == 1 && mip_array.LastLevel() == 1 &&
+	            mip_array.MaxMip() == 7 &&
+	            mip_array.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+	            mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
+	        "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
+	ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array, 0x30000);
 
 	const auto uint_array = BasicUintArrayStorageTextureDescriptor();
 	Require("BasicStorageTexture", "uint 2D-array descriptor",
@@ -16262,7 +16597,6 @@ void CheckBasicStorageTextureDescriptor() {
 	                        "yzwx-read",
 	                        "reserved-swizzle",
 	                        "array-base-out-of-range",
-	                        "array-mip-view",
 	                        "reserved",
 	                        "uint-format",
 	                        "uint-resource-float-format",
@@ -17431,6 +17765,7 @@ int main(int argc, char** argv) {
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());
 	CheckEmbeddedFetchVertexOffset();
 	CheckEmbeddedFetchLaneSpill();
+	CheckRectListShaders();
 	CheckPs5GameExampleImageClearRuntimeShape();
 	vulkan.CheckSchedulerTimeline();
 	vulkan.CheckGpuMappedRangeLifecycle();

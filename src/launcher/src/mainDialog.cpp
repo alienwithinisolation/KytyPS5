@@ -205,6 +205,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
+	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
@@ -216,7 +217,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	args << "--profiler-direction" << EnumToText(info.profiler_direction);
 	args << "--spirv-debug-printf" << "false";
-	args << "--ngg-rectlist-draw" << BoolArg(info.ngg_rectlist_draw_enabled);
 	if (info.renderdoc_enabled) {
 		args << "--rd";
 	}
