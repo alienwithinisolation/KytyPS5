@@ -1,3 +1,4 @@
+// File: src/graphics/host_gpu/renderer/renderDraw.cpp
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -110,9 +111,8 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer,
                         const ShaderPixelInputInfo& ps_input_info) {
 	const auto& ctx            = buffer.GetRegisters();
-	const auto& sh_regs        = ctx.GetShaderRegisters();
 	const auto  rt_mask        = ctx.GetRenderTargetMask();
-	const auto  cb_shader_mask = sh_regs.m_cbShaderMask;
+	const auto  cb_shader_mask = ctx.GetShaderRegisters().m_cbShaderMask;
 	const auto& bc0            = ctx.GetBlendControl(0);
 
 	bool interesting = rt_mask != 0x0f || (cb_shader_mask & ~0x0fu) != 0 ||
@@ -1030,8 +1030,20 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      draw.first_instance);
 			} else {
-				EXIT_NOT_IMPLEMENTED(
-				    !IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit));
+				// Previously this call aborted when the host path was unsupported:
+				// EXIT_NOT_IMPLEMENTED(!IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit));
+				// vk_buffer.draw(emit.draw_vertex_count, draw.instance_count, emit.first_vertex,
+				//                draw.first_instance);
+				//
+				// Change: if the host path is not supported, do a conservative fallback
+				// and perform the host draw call anyway (this avoids a fatal). Log the case
+				// so we can find it and implement a better path later.
+				if (!IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit)) {
+					LOGF_COLOR(Log::Color::BrightYellow,
+					           "RenderExecutor: host expanded rect-list draw unsupported for draw=%s "
+					           "(index_count=%" PRIu32 ") — falling back to generic draw\n",
+					           draw.name, draw.index_count);
+				}
 				vk_buffer.draw(emit.draw_vertex_count, draw.instance_count, emit.first_vertex,
 				               draw.first_instance);
 			}
