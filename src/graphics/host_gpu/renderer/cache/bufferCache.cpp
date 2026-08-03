@@ -697,8 +697,8 @@ void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data)
 		if (begin >= range_end) {
 			continue;
 		}
-		Upload(m_scheduler.Current(), *cached->buffer, cached.buffer->Offset(begin),
-		       data.data() + begin - vaddr, range_end - begin);
+Upload(m_scheduler.Current(), *cached->buffer, cached->buffer->Offset(begin),
+	data.data() + begin - vaddr, range_end - begin);
 		cached->tick_accessed_last = m_gc_tick;
 	}
 }
