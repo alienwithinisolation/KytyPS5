@@ -1,3 +1,4 @@
+// (This is the full file with the unaligned FillBuffer fix.)
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
@@ -696,17 +697,20 @@ void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data)
 		if (begin >= range_end) {
 			continue;
 		}
-		Upload(m_scheduler.Current(), *cached->buffer, cached->buffer->Offset(begin),
+		Upload(m_scheduler.Current(), *cached->buffer, cached.buffer->Offset(begin),
 		       data.data() + begin - vaddr, range_end - begin);
 		cached->tick_accessed_last = m_gc_tick;
 	}
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
-	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: fill range must be dword aligned\n");
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid fill range\n");
 	}
 	if (is_gds) {
+		if ((vaddr & 3u) != 0 || (size & 3u) != 0) {
+			EXIT("BufferCache: GDS fill must be dword aligned\n");
+		}
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
 			EXIT("BufferCache: GDS fill range is out of bounds\n");
 		}
@@ -717,6 +721,33 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+
+	// If the fill is not dword aligned (address or size), handle carefully:
+	if ((vaddr & 3u) != 0 || (size & 3u) != 0) {
+		// Log once per occurrence. This is allowed by some guest code.
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "BufferCache::FillBuffer: unaligned fill request addr=0x%016" PRIx64
+		           " size=%" PRIu64 " value=0x%08" PRIx32 " — using bytewise fallback\n",
+		           vaddr, size, value);
+
+		// Construct a byte-stream representing the repeated 32-bit value in little-endian order.
+		std::vector<uint8_t> bytes;
+		bytes.resize(size);
+		const uint8_t pattern[4] = {
+		    static_cast<uint8_t>(value & 0xffu),
+		    static_cast<uint8_t>((value >> 8) & 0xffu),
+		    static_cast<uint8_t>((value >> 16) & 0xffu),
+		    static_cast<uint8_t>((value >> 24) & 0xffu),
+		};
+		for (uint64_t i = 0; i < size; ++i) {
+			bytes[i] = pattern[i & 3u];
+		}
+		// Write via the host backing path which will update cached buffers as needed.
+		WriteHostMemory(vaddr, std::span<const uint8_t>(bytes.data(), bytes.size()));
+		return;
+	}
+
+	// Aligned fast-path (existing behavior).
 	{
 		std::lock_guard transaction(m_resource_mutex);
 		const auto      region = m_texture_cache.QueryRegion(vaddr, size);
