@@ -32,7 +32,7 @@ namespace ImageViewOps {
 	return true;
 }
 
-[[noreturn]] inline void UnsupportedColorView(const char* usage, vk::Format image_format,
+inline void UnsupportedColorView(const char* usage, vk::Format image_format,
                                               vk::Format view_format, uint32_t swizzle) noexcept {
 	EXIT("unsupported %s color image view: image_format=%d view_format=%d swizzle=0x%03x\n", usage,
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
@@ -59,6 +59,7 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 		return swizzle;
 	}
 	UnsupportedColorView("sampled", image_format, view_format, swizzle);
+	return 0;
 }
 
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
@@ -82,6 +83,7 @@ SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t
 	}
 	EXIT("unsupported sampled depth image view: image_format=%d view_format=%d swizzle=0x%03x\n",
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
+	return 0;
 }
 
 [[nodiscard]] inline bool
