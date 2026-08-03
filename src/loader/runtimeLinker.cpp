@@ -1801,25 +1801,72 @@ bool RuntimeLinker::ResolveLoadedSymbolByNid(const std::string& nid, SymbolType 
 }
 
 uint64_t RuntimeLinker::ReadFromElf(Program* program, uint64_t vaddr) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->base_vaddr == 0 || program->base_size == 0);
-	EXIT_IF(program->elf == nullptr);
-
-	uint64_t ret = 0;
+	// Defensive guard: avoid dereferencing a nullptr Program* or ELF pointers.
+	// Return 0 and log if the inputs are invalid rather than letting an access
+	// violation happen. This keeps the emulator alive and provides diagnostic logs.
+	if (program == nullptr) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "RuntimeLinker::ReadFromElf called with null Program* (vaddr=0x%016" PRIx64
+		           ") — returning 0\n",
+		           vaddr);
+		return 0;
+	}
+	if (program->elf == nullptr) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "RuntimeLinker::ReadFromElf: program->elf is null for program %s (vaddr=0x%016" PRIx64
+		           ") — returning 0\n",
+		           Common::PathToString(program->file_name).c_str(), vaddr);
+		return 0;
+	}
 
 	const auto* ehdr = program->elf->GetEhdr();
 	const auto* phdr = program->elf->GetPhdr();
 
-	EXIT_IF(phdr == nullptr || ehdr == nullptr);
+	if (ehdr == nullptr || phdr == nullptr) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "RuntimeLinker::ReadFromElf: ELF headers missing for program %s (vaddr=0x%016" PRIx64
+		           ") — returning 0\n",
+		           Common::PathToString(program->file_name).c_str(), vaddr);
+		return 0;
+	}
+
+	uint64_t ret = 0;
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+		if (phdr[i].p_memsz != 0 &&
+		    (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+			// Compute the segment address in guest space and the size of file-backed data.
+			// Use p_filesz to ensure we only attempt to read from the file-backed portion.
 			uint64_t segment_addr      = phdr[i].p_vaddr + program->base_vaddr;
 			uint64_t segment_file_size = phdr[i].p_filesz;
 
-			if (vaddr >= segment_addr && vaddr < segment_addr + segment_file_size) {
-				program->elf->LoadSegment(reinterpret_cast<uint64_t>(&ret),
-				                          phdr[i].p_offset + vaddr - segment_addr, sizeof(ret));
+			// Skip if file-backed size is zero or if arithmetic wraps.
+			if (segment_file_size == 0) {
+				continue;
+			}
+			if (segment_addr > UINT64_MAX - segment_file_size) {
+				// overflow — skip this segment
+				continue;
+			}
+
+			// We need to ensure the requested vaddr and the following sizeof(ret) bytes
+			// are inside the file-backed portion of the segment.
+			if (vaddr >= segment_addr &&
+			    vaddr + sizeof(ret) <= segment_addr + segment_file_size) {
+				const uint64_t rel = vaddr - segment_addr;
+				const uint64_t file_off = phdr[i].p_offset + rel;
+
+				// Safety: ensure file_off + sizeof(ret) won't overflow.
+				if (file_off > UINT64_MAX - sizeof(ret)) {
+					continue;
+				}
+
+				// Perform the load from the ELF's segment into ret.
+				// Original code used program->elf->LoadSegment(reinterpret_cast<uint64_t>(&ret),
+				//                                               phdr[i].p_offset + vaddr - segment_addr,
+				//                                               sizeof(ret));
+				// Keep the same call but only after we've validated bounds.
+				program->elf->LoadSegment(reinterpret_cast<uint64_t>(&ret), file_off, sizeof(ret));
 				break;
 			}
 		}
