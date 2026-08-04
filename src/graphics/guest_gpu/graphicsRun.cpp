@@ -449,33 +449,83 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	EXIT_NOT_IMPLEMENTED((num_bytes & 3u) != 0);
-	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
-	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
-	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
-	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
-	EXIT_NOT_IMPLEMENTED(block_engine > 1);
-	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
-		return;
-	}
-	auto decode_gds = [](uint8_t selector, bool& is_gds) {
-		switch (selector) {
-			case 0:
-			case 3: is_gds = false; return true;
-			case 1: is_gds = true; return true;
-			default: return false;
-		}
-	};
-	bool dst_gds = false;
-	if (!decode_gds(dst_sel, dst_gds)) {
-		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
-	}
-	auto& buffer_cache = GetGpuResources().GetBufferCache();
-	if (src_sel == 2) {
-		buffer_cache.FillBuffer(
-		    dst_address_or_offset, num_bytes,
-		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
-		return;
+	    // Validate basic parameters (but allow non-dword sizes; handle fallback below).
+    EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
+    EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
+    EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
+    EXIT_NOT_IMPLEMENTED(write_confirm > 1);
+    EXIT_NOT_IMPLEMENTED(block_engine > 1);
+    if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+        return;
+    }
+    auto decode_gds = [](uint8_t selector, bool& is_gds) {
+        switch (selector) {
+            case 0:
+            case 3: is_gds = false; return true;
+            case 1: is_gds = true; return true;
+            default: return false;
+        }
+    };
+    bool dst_gds = false;
+    if (!decode_gds(dst_sel, dst_gds)) {
+        EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+    }
+    auto& buffer_cache = GetGpuResources().GetBufferCache();
+
+    // Immediate-fill special-case (src_sel == 2) already handles unaligned sizes inside FillBuffer.
+    if (src_sel == 2) {
+        buffer_cache.FillBuffer(
+            dst_address_or_offset, num_bytes,
+            static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+        return;
+    }
+
+    bool src_gds = false;
+    if (!decode_gds(src_sel, src_gds)) {
+        EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
+    }
+    if (src_gds && dst_gds) {
+        EXIT("unsupported dmaData GDS-to-GDS copy\n");
+    }
+
+    // If transfer size is dword-aligned, use the fast path.
+    if ((num_bytes & 3u) == 0) {
+        buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
+                                dst_gds, src_gds);
+        return;
+    }
+
+    // Handle unaligned size: split into aligned + trailing tail (1..3 bytes).
+    // NOTE: GDS requires dword alignment; we do not try to support unaligned GDS transfers here.
+    if (dst_gds || src_gds) {
+        EXIT("unaligned dma involving GDS is not supported\n");
+    }
+
+    const uint64_t aligned = num_bytes & ~uint64_t{3};
+    const uint32_t tail    = static_cast<uint32_t>(num_bytes - aligned);
+
+    // Do aligned portion via existing fast path if any.
+    if (aligned != 0) {
+        buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, aligned,
+                                false /*dst_gds*/, false /*src_gds*/);
+    }
+
+    // Handle the trailing 1..3 bytes by reading the guest backing and writing the remaining bytes.
+    const uint64_t tail_src_addr = src_address_or_offset_or_immediate + aligned;
+    const uint64_t tail_dst_addr = dst_address_or_offset + aligned;
+
+    std::vector<uint8_t> tail_buf;
+    tail_buf.resize(tail);
+    if (!Libs::LibKernel::Memory::TryReadBacking(tail_src_addr, tail_buf.data(), tail)) {
+        EXIT("BufferCache: host DMA source has no direct backing for unaligned tail\n");
+    }
+
+    // Write tail bytes into guest backing and invalidate buffer cache region so cached buffers will be updated.
+    Libs::LibKernel::Memory::WriteBacking(tail_dst_addr, tail_buf.data(), tail);
+    // Invalidate so BufferCache will pick up the updated guest backing ranges if needed.
+    buffer_cache.InvalidateMemory(tail_dst_addr, tail);
+
+    return;
 	}
 	bool src_gds = false;
 	if (!decode_gds(src_sel, src_gds)) {
