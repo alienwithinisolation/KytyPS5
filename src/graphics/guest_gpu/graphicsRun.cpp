@@ -449,7 +449,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	    // Validate basic parameters (but allow non-dword sizes; handle fallback below).
+    // Validate basic parameters (but allow non-dword sizes; handle fallback below).
     EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
     EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
     EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
@@ -496,7 +496,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
     }
 
     // Handle unaligned size: split into aligned + trailing tail (1..3 bytes).
-    // NOTE: GDS requires dword alignment; we do not try to support unaligned GDS transfers here.
+    // NOTE: GDS requires dword alignment; do not support unaligned GDS transfers here.
     if (dst_gds || src_gds) {
         EXIT("unaligned dma involving GDS is not supported\n");
     }
@@ -522,7 +522,6 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
     // Write tail bytes into guest backing and invalidate buffer cache region so cached buffers will be updated.
     Libs::LibKernel::Memory::WriteBacking(tail_dst_addr, tail_buf.data(), tail);
-    // Invalidate so BufferCache will pick up the updated guest backing ranges if needed.
     buffer_cache.InvalidateMemory(tail_dst_addr, tail);
 
     return;
