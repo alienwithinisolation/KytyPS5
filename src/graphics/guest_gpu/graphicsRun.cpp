@@ -445,94 +445,45 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
-    EXIT_NOT_IMPLEMENTED(engine > 1);
-    if (num_bytes == 0) {
-        return;
-    }
-
-    // Validate other parameters (but allow non-dword sizes; we handle tails below).
-    EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
-    EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
-    EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
-    EXIT_NOT_IMPLEMENTED(write_confirm > 1);
-    EXIT_NOT_IMPLEMENTED(block_engine > 1);
-    if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
-        return;
-    }
-
-    auto decode_gds = [](uint8_t selector, bool& is_gds) {
-        switch (selector) {
-            case 0:
-            case 3: is_gds = false; return true;
-            case 1: is_gds = true; return true;
-            default: return false;
-        }
-    };
-
-    bool dst_gds = false;
-    if (!decode_gds(dst_sel, dst_gds)) {
-        EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
-    }
-
-    auto& buffer_cache = GetGpuResources().GetBufferCache();
-
-    // Immediate-fill special-case (src_sel == 2) — FillBuffer already handles unaligned sizes.
-    if (src_sel == 2) {
-        buffer_cache.FillBuffer(
-            dst_address_or_offset, num_bytes,
-            static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
-        return;
-    }
-
-    bool src_gds = false;
-    if (!decode_gds(src_sel, src_gds)) {
-        EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
-    }
-    if (src_gds && dst_gds) {
-        EXIT("unsupported dmaData GDS-to-GDS copy\n");
-    }
-
-    // Fast-path if size is dword-aligned.
-    if ((num_bytes & 3u) == 0) {
-        buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
-                                dst_gds, src_gds);
-        return;
-    }
-
-    // Do not attempt unaligned transfers involving GDS.
-    if (dst_gds || src_gds) {
-        EXIT("unaligned dma involving GDS is not supported\n");
-    }
-
-    // Split into aligned dword portion + trailing 1..3 byte tail.
-    const uint64_t aligned = num_bytes & ~uint64_t{3};
-    const uint32_t tail    = static_cast<uint32_t>(num_bytes - aligned);
-
-    // Copy aligned portion via the normal fast path.
-    if (aligned != 0) {
-        buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, aligned,
-                                false /*dst_gds*/, false /*src_gds*/);
-    }
-
-    // Read the tail bytes from the source backing and write them to the guest backing.
-    const uint64_t tail_src_addr = src_address_or_offset_or_immediate + aligned;
-    const uint64_t tail_dst_addr = dst_address_or_offset + aligned;
-
-    std::vector<uint8_t> tail_buf;
-    tail_buf.resize(tail);
-
-    // Prefer host backing read; if unavailable we must fail safely instead of producing corrupt memory.
-    if (!Libs::LibKernel::Memory::TryReadBacking(tail_src_addr, tail_buf.data(), tail)) {
-        EXIT("BufferCache: host DMA source has no direct backing for unaligned tail\n");
-    }
-
-    Libs::LibKernel::Memory::WriteBacking(tail_dst_addr, tail_buf.data(), tail);
-
-    // Ensure buffer cache / texture cache notice the written tail bytes.
-    buffer_cache.InvalidateMemory(tail_dst_addr, tail);
-
-    return;
+	EXIT_NOT_IMPLEMENTED(engine > 1);
+	if (num_bytes == 0) {
+		return;
 	}
+
+	// Validate other parameters (but allow non-dword sizes; we handle tails below).
+	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
+	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
+	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
+	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
+	EXIT_NOT_IMPLEMENTED(block_engine > 1);
+	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+		return;
+	}
+
+	auto decode_gds = [](uint8_t selector, bool& is_gds) {
+		switch (selector) {
+			case 0:
+			case 3: is_gds = false; return true;
+			case 1: is_gds = true; return true;
+			default: return false;
+		}
+	};
+
+	bool dst_gds = false;
+	if (!decode_gds(dst_sel, dst_gds)) {
+		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+
+	auto& buffer_cache = GetGpuResources().GetBufferCache();
+
+	// Immediate-fill special-case (src_sel == 2) — FillBuffer already handles unaligned sizes.
+	if (src_sel == 2) {
+		buffer_cache.FillBuffer(
+		    dst_address_or_offset, num_bytes,
+		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		return;
+	}
+
 	bool src_gds = false;
 	if (!decode_gds(src_sel, src_gds)) {
 		EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
@@ -540,8 +491,57 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
-	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
-	                        dst_gds, src_gds);
+
+	// Fast-path if size is dword-aligned.
+	if ((num_bytes & 3u) == 0) {
+		buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
+		                        dst_gds, src_gds);
+		return;
+	}
+
+	// Do not attempt unaligned transfers involving GDS.
+	if (dst_gds || src_gds) {
+		EXIT("unaligned dma involving GDS is not supported\n");
+	}
+
+	// Split into aligned dword portion + trailing 1..3 byte tail.
+	const uint64_t aligned = num_bytes & ~uint64_t{3};
+	const uint32_t tail    = static_cast<uint32_t>(num_bytes - aligned);
+
+	// Copy aligned portion via the normal fast path.
+	if (aligned != 0) {
+		buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, aligned,
+		                        false /*dst_gds*/, false /*src_gds*/);
+	}
+
+	// Read the tail bytes from the source backing and write them to the guest backing.
+	const uint64_t tail_src_addr = src_address_or_offset_or_immediate + aligned;
+	const uint64_t tail_dst_addr = dst_address_or_offset + aligned;
+
+	std::vector<uint8_t> tail_buf;
+	tail_buf.resize(tail);
+
+	// Prefer host backing read; if unavailable we must fail safely instead of producing corrupt memory.
+	if (!LibKernel::Memory::TryReadBacking(tail_src_addr, tail_buf.data(), tail)) {
+		EXIT("BufferCache: host DMA source has no direct backing for unaligned tail\n");
+	}
+
+	LibKernel::Memory::WriteBacking(tail_dst_addr, tail_buf.data(), tail);
+
+	// Ensure buffer cache / texture cache notice the written tail bytes.
+	buffer_cache.InvalidateMemory(tail_dst_addr, tail);
+
+	return;
+}
+bool src_gds = false;
+if (!decode_gds(src_sel, src_gds)) {
+	EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
+}
+if (src_gds && dst_gds) {
+	EXIT("unsupported dmaData GDS-to-GDS copy\n");
+}
+buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
+                        dst_gds, src_gds);
 }
 
 void GpuState::Enqueue(Submission submission) {
@@ -719,7 +719,7 @@ bool GpuState::Process(Submission& submission) {
 				LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
 				     reinterpret_cast<uint64_t>(buffer), num_dw);
 				for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
-					LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIx32 "\n", i, buffer[i]);
+					LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIu32 "\n", i, buffer[i]);
 				}
 			}
 			if (first_slice) {
@@ -1215,25 +1215,25 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 				     oa.GetSpaceAvailable());
 			}
 		}
-
-		const auto& cs = m_sh_ctx.GetCs().cs_regs;
-		local_x        = std::max(cs.num_thread_x, 1u);
-		local_y        = std::max(cs.num_thread_y, 1u);
-		local_z        = std::max(cs.num_thread_z, 1u);
-		if (cs.wave_size == 64u) {
-			static std::atomic_bool logged_wave64_shader {false};
-			if (!logged_wave64_shader.exchange(true, std::memory_order_relaxed)) {
-				LOGF("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",
-				     cs.data_addr);
-				std::printf("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",
-				            cs.data_addr);
-				std::fflush(stdout);
-			}
-		}
-
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
 	}
+
+	const auto& cs = m_sh_ctx.GetCs().cs_regs;
+	local_x        = std::max(cs.num_thread_x, 1u);
+	local_y        = std::max(cs.num_thread_y, 1u);
+	local_z        = std::max(cs.num_thread_z, 1u);
+	if (cs.wave_size == 64u) {
+		static std::atomic_bool logged_wave64_shader {false};
+		if (!logged_wave64_shader.exchange(true, std::memory_order_relaxed)) {
+			LOGF("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",
+			     cs.data_addr);
+			std::printf("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",
+			            cs.data_addr);
+			std::fflush(stdout);
+		}
+	}
+
+	m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+	                                              thread_group_y, thread_group_z, mode);
 
 	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
 	auto               group_count = [](uint32_t threads, uint32_t group_size) {
