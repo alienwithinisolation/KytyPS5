@@ -445,11 +445,12 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
-	EXIT_NOT_IMPLEMENTED(engine > 1);
-	if (num_bytes == 0) {
-		return;
-	}
-    // Validate basic parameters (but allow non-dword sizes; handle fallback below).
+    EXIT_NOT_IMPLEMENTED(engine > 1);
+    if (num_bytes == 0) {
+        return;
+    }
+
+    // Validate other parameters (but allow non-dword sizes; we handle tails below).
     EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
     EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
     EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
@@ -458,6 +459,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
     if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
         return;
     }
+
     auto decode_gds = [](uint8_t selector, bool& is_gds) {
         switch (selector) {
             case 0:
@@ -466,13 +468,15 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
             default: return false;
         }
     };
+
     bool dst_gds = false;
     if (!decode_gds(dst_sel, dst_gds)) {
         EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
     }
+
     auto& buffer_cache = GetGpuResources().GetBufferCache();
 
-    // Immediate-fill special-case (src_sel == 2) already handles unaligned sizes inside FillBuffer.
+    // Immediate-fill special-case (src_sel == 2) — FillBuffer already handles unaligned sizes.
     if (src_sel == 2) {
         buffer_cache.FillBuffer(
             dst_address_or_offset, num_bytes,
@@ -488,40 +492,43 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
         EXIT("unsupported dmaData GDS-to-GDS copy\n");
     }
 
-    // If transfer size is dword-aligned, use the fast path.
+    // Fast-path if size is dword-aligned.
     if ((num_bytes & 3u) == 0) {
         buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
                                 dst_gds, src_gds);
         return;
     }
 
-    // Handle unaligned size: split into aligned + trailing tail (1..3 bytes).
-    // NOTE: GDS requires dword alignment; do not support unaligned GDS transfers here.
+    // Do not attempt unaligned transfers involving GDS.
     if (dst_gds || src_gds) {
         EXIT("unaligned dma involving GDS is not supported\n");
     }
 
+    // Split into aligned dword portion + trailing 1..3 byte tail.
     const uint64_t aligned = num_bytes & ~uint64_t{3};
     const uint32_t tail    = static_cast<uint32_t>(num_bytes - aligned);
 
-    // Do aligned portion via existing fast path if any.
+    // Copy aligned portion via the normal fast path.
     if (aligned != 0) {
         buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, aligned,
                                 false /*dst_gds*/, false /*src_gds*/);
     }
 
-    // Handle the trailing 1..3 bytes by reading the guest backing and writing the remaining bytes.
+    // Read the tail bytes from the source backing and write them to the guest backing.
     const uint64_t tail_src_addr = src_address_or_offset_or_immediate + aligned;
     const uint64_t tail_dst_addr = dst_address_or_offset + aligned;
 
     std::vector<uint8_t> tail_buf;
     tail_buf.resize(tail);
+
+    // Prefer host backing read; if unavailable we must fail safely instead of producing corrupt memory.
     if (!Libs::LibKernel::Memory::TryReadBacking(tail_src_addr, tail_buf.data(), tail)) {
         EXIT("BufferCache: host DMA source has no direct backing for unaligned tail\n");
     }
 
-    // Write tail bytes into guest backing and invalidate buffer cache region so cached buffers will be updated.
     Libs::LibKernel::Memory::WriteBacking(tail_dst_addr, tail_buf.data(), tail);
+
+    // Ensure buffer cache / texture cache notice the written tail bytes.
     buffer_cache.InvalidateMemory(tail_dst_addr, tail);
 
     return;
