@@ -72,28 +72,19 @@ jobs:
 
       - name: Configure
         shell: cmd
-        run: |
-          cmake -S src -B _Build/windows ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+        run: cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build
         shell: cmd
-        run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests virtual_memory_allocation_tests --parallel
+        run: cmake --build _Build/windows --target launcher audio_out2_port_tests virtual_memory_allocation_tests --parallel
 
       - name: Test
         shell: cmd
-        run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|virtual_memory_allocation)$"
+        run: ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
-        run: |
-          cmake --install _Build/windows --prefix _Build/windows/install
+        run: cmake --install _Build/windows --prefix _Build/windows/install
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
