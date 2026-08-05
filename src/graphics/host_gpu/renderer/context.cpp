@@ -220,12 +220,12 @@ if (result != vk::Result::eSuccess) {
          m_debug_arg4);
 
     if (result == vk::Result::eErrorDeviceLost) {
-        // Device lost is fatal for Vulkan; handle cleanup or reinit here.
+        // Device lost is fatal for Vulkan and requires full device reinitialization.
         EXIT("Vulkan device lost during waitForFences");
     }
 
-    // For other results treat them as transient: mark fence as waited to avoid re-waiting
-    // and return so execution can continue. Alternatively, you can retry a few times here.
+    // Treat other non-success results as transient: mark fence as waited to avoid re-waiting
+    // and return so execution can continue. Optionally implement retries here if desired.
     m_fence_waited = true;
     return;
 }
